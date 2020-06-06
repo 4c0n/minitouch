@@ -57,6 +57,7 @@ typedef struct
   int has_pressure;
   int min_pressure;
   int max_pressure;
+  int is_singletouch;
   int max_x;
   int max_y;
   int max_contacts;
@@ -88,6 +89,30 @@ static int is_multitouch_device(struct libevdev* evdev)
   return libevdev_has_event_code(evdev, EV_ABS, ABS_MT_POSITION_X);
 }
 
+static int is_singletouch_device(struct libevdev* evdev)
+{
+  return libevdev_has_event_code(evdev, EV_ABS, ABS_X);
+}
+
+static void set_abs_configuration( internal_state_t* state)
+{
+  if (libevdev_has_event_code(state->evdev,EV_ABS, ABS_MT_POSITION_X)
+    && libevdev_has_event_code(state->evdev, EV_ABS, ABS_MT_POSITION_Y))
+  {
+    state->is_singletouch = 0;
+    state->max_x = libevdev_get_abs_maximum(state->evdev, ABS_MT_POSITION_X);
+    state->max_y = libevdev_get_abs_maximum(state->evdev, ABS_MT_POSITION_Y);
+    return;
+  }
+  if(libevdev_has_event_code(state->evdev,EV_ABS, ABS_X) && libevdev_has_event_code(state->evdev,EV_ABS, ABS_Y))
+  {
+    state->is_singletouch = 1;
+    state->max_x = libevdev_get_abs_maximum(state->evdev, ABS_X);
+    state->max_y = libevdev_get_abs_maximum(state->evdev, ABS_Y);
+    return;
+  }
+}
+
 static int consider_device(const char* devpath, internal_state_t* state)
 {
   int fd = -1;
@@ -111,12 +136,15 @@ static int consider_device(const char* devpath, internal_state_t* state)
     goto mismatch;
   }
 
-  if (!is_multitouch_device(evdev))
+  int score = 5000;
+  if (is_multitouch_device(evdev))
+  {
+    score += 5000;
+  }
+  else if (!is_single_touch_device(evdev))
   {
     goto mismatch;
   }
-
-  int score = 10000;
 
   if (libevdev_has_event_code(evdev, EV_ABS, ABS_MT_TOOL_TYPE))
   {
@@ -286,7 +314,7 @@ static int next_tracking_id(internal_state_t* state)
   return state->tracking_id;
 }
 
-static int type_a_commit(internal_state_t* state)
+static int type_a_multi_touch_commit(internal_state_t* state)
 {
   int contact;
   int found_any = 0;
@@ -368,6 +396,79 @@ static int type_a_commit(internal_state_t* state)
   return 1;
 }
 
+static int type_a_single_touch_commit(internal_state_t* state)
+{
+  int contact;
+  int found_any = 0;
+
+  for (contact = 0; contact < state->max_contacts; ++contact)
+  {
+    switch (state->contacts[contact].enabled)
+    {
+      case 1: // WENT_DOWN
+        found_any = 1;
+
+        if (state->has_tracking_id)
+          WRITE_EVENT(state, EV_ABS, ABS_MT_TRACKING_ID, contact);
+
+        if (state->has_key_btn_touch)
+          WRITE_EVENT(state, EV_KEY, BTN_TOUCH, 1);
+
+        if (state->has_touch_major)
+          WRITE_EVENT(state, EV_ABS, ABS_MT_TOUCH_MAJOR, 0x00000006);
+
+        if (state->has_width_major)
+          WRITE_EVENT(state, EV_ABS, ABS_MT_WIDTH_MAJOR, 0x00000004);
+
+        if (state->has_pressure)
+          WRITE_EVENT(state, EV_ABS, ABS_MT_PRESSURE, state->contacts[contact].pressure);
+
+        WRITE_EVENT(state, EV_ABS, ABS_X, state->contacts[contact].x);
+        WRITE_EVENT(state, EV_ABS, ABS_Y, state->contacts[contact].y);
+
+        state->contacts[contact].enabled = 2;
+        break;
+      case 2: // MOVED
+        found_any = 1;
+
+        if (state->has_tracking_id)
+          WRITE_EVENT(state, EV_ABS, ABS_MT_TRACKING_ID, contact);
+
+        if (state->has_touch_major)
+          WRITE_EVENT(state, EV_ABS, ABS_MT_TOUCH_MAJOR, 0x00000006);
+
+        if (state->has_width_major)
+          WRITE_EVENT(state, EV_ABS, ABS_MT_WIDTH_MAJOR, 0x00000004);
+
+        if (state->has_pressure)
+          WRITE_EVENT(state, EV_ABS, ABS_MT_PRESSURE, state->contacts[contact].pressure);
+
+        WRITE_EVENT(state, EV_ABS, ABS_X, state->contacts[contact].x);
+        WRITE_EVENT(state, EV_ABS, ABS_Y, state->contacts[contact].y);
+
+        break;
+      case 3: // WENT_UP
+        found_any = 1;
+
+        if (state->has_tracking_id)
+          WRITE_EVENT(state, EV_ABS, ABS_MT_TRACKING_ID, contact);
+
+        if (state->has_key_btn_touch)
+          WRITE_EVENT(state, EV_KEY, BTN_TOUCH, 0);
+
+        WRITE_EVENT(state, EV_SYN, SYN_MT_REPORT, 0);
+
+        state->contacts[contact].enabled = 0;
+        break;
+    }
+  }
+
+  if (found_any)
+    WRITE_EVENT(state, EV_SYN, SYN_REPORT, 0);
+
+  return 1;
+}
+
 static int type_a_touch_panic_reset_all(internal_state_t* state)
 {
   int contact;
@@ -384,7 +485,10 @@ static int type_a_touch_panic_reset_all(internal_state_t* state)
     }
   }
 
-  return type_a_commit(state);
+  if (state->is_singletouch)
+    return type_a_single_touch_commit(state);
+  else
+    return type_a_multi_touch_commit(state);
 }
 
 static int type_a_touch_down(internal_state_t* state, int contact, int x, int y, int pressure)
@@ -458,7 +562,7 @@ static int type_b_touch_panic_reset_all(internal_state_t* state)
   return found_any ? type_b_commit(state) : 1;
 }
 
-static int type_b_touch_down(internal_state_t* state, int contact, int x, int y, int pressure)
+static int type_b_multi_touch_down(internal_state_t* state, int contact, int x, int y, int pressure)
 {
   if (contact >= state->max_contacts)
   {
@@ -497,7 +601,44 @@ static int type_b_touch_down(internal_state_t* state, int contact, int x, int y,
   return 1;
 }
 
-static int type_b_touch_move(internal_state_t* state, int contact, int x, int y, int pressure)
+static int type_b_single_touch_down(internal_state_t* state, int contact, int x, int y, int pressure)
+{
+  if (contact >= state->max_contacts)
+  {
+    return 0;
+  }
+
+  if (state->contacts[contact].enabled)
+  {
+    type_b_touch_panic_reset_all(state);
+  }
+
+  state->contacts[contact].enabled = 1;
+  state->contacts[contact].tracking_id = next_tracking_id(state);
+
+  WRITE_EVENT(state, EV_ABS, ABS_MT_SLOT, contact);
+  WRITE_EVENT(state, EV_ABS, ABS_MT_TRACKING_ID,
+    state->contacts[contact].tracking_id);
+
+  if (state->has_key_btn_touch)
+    WRITE_EVENT(state, EV_KEY, BTN_TOUCH, 1);
+
+  if (state->has_touch_major)
+    WRITE_EVENT(state, EV_ABS, ABS_MT_TOUCH_MAJOR, 0x00000006);
+
+  if (state->has_width_major)
+    WRITE_EVENT(state, EV_ABS, ABS_MT_WIDTH_MAJOR, 0x00000004);
+
+  if (state->has_pressure)
+    WRITE_EVENT(state, EV_ABS, ABS_MT_PRESSURE, pressure);
+
+  WRITE_EVENT(state, EV_ABS, ABS_X, x);
+  WRITE_EVENT(state, EV_ABS, ABS_Y, y);
+
+  return 1;
+}
+
+static int type_b_multi_touch_move(internal_state_t* state, int contact, int x, int y, int pressure)
 {
   if (contact >= state->max_contacts || !state->contacts[contact].enabled)
   {
@@ -517,6 +658,30 @@ static int type_b_touch_move(internal_state_t* state, int contact, int x, int y,
 
   WRITE_EVENT(state, EV_ABS, ABS_MT_POSITION_X, x);
   WRITE_EVENT(state, EV_ABS, ABS_MT_POSITION_Y, y);
+
+  return 1;
+}
+
+static int type_b_single_touch_move(internal_state_t* state, int contact, int x, int y, int pressure)
+{
+  if (contact >= state->max_contacts || !state->contacts[contact].enabled)
+  {
+    return 0;
+  }
+
+  WRITE_EVENT(state, EV_ABS, ABS_MT_SLOT, contact);
+
+  if (state->has_touch_major)
+    WRITE_EVENT(state, EV_ABS, ABS_MT_TOUCH_MAJOR, 0x00000006);
+
+  if (state->has_width_major)
+    WRITE_EVENT(state, EV_ABS, ABS_MT_WIDTH_MAJOR, 0x00000004);
+
+  if (state->has_pressure)
+    WRITE_EVENT(state, EV_ABS, ABS_MT_PRESSURE, pressure);
+
+  WRITE_EVENT(state, EV_ABS, ABS_X, x);
+  WRITE_EVENT(state, EV_ABS, ABS_Y, y);
 
   return 1;
 }
@@ -546,7 +711,10 @@ static int touch_down(internal_state_t* state, int contact, int x, int y, int pr
 {
   if (state->has_mtslot)
   {
-    return type_b_touch_down(state, contact, x, y, pressure);
+    if (state ->is_singletouch)
+      return type_b_single_touch_down(state, contact, x, y, pressure);
+    else
+      return type_b_multi_touch_down(state, contact, x, y, pressure);
   }
   else
   {
@@ -558,7 +726,10 @@ static int touch_move(internal_state_t* state, int contact, int x, int y, int pr
 {
   if (state->has_mtslot)
   {
-    return type_b_touch_move(state, contact, x, y, pressure);
+    if (state ->is_singletouch)
+      return type_b_single_touch_move(state, contact, x, y, pressure);
+    else
+      return type_b_multi_touch_move(state, contact, x, y, pressure);
   }
   else
   {
@@ -598,7 +769,10 @@ static int commit(internal_state_t* state)
   }
   else
   {
-    return type_a_commit(state);
+    if (state->is_singletouch)
+      return type_a_single_touch_commit(state);
+    else
+      return type_a_multi_touch_commit(state);
   }
 }
 
@@ -846,8 +1020,7 @@ int main(int argc, char* argv[])
     state.max_pressure= state.has_pressure ?
       libevdev_get_abs_maximum(state.evdev, ABS_MT_PRESSURE) : 0;
 
-    state.max_x = libevdev_get_abs_maximum(state.evdev, ABS_MT_POSITION_X);
-    state.max_y = libevdev_get_abs_maximum(state.evdev, ABS_MT_POSITION_Y);
+    set_abs_configuration(&state);
 
     state.max_tracking_id = state.has_tracking_id
       ? libevdev_get_abs_maximum(state.evdev, ABS_MT_TRACKING_ID)
